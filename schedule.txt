@@ -1,0 +1,8 @@
+# Your final pairing: 5 lines, each two jobs[] slot numbers (0-9) that run
+# together on the two hardware threads of one core. Every slot 0-9 must
+# appear exactly once. This placeholder is only an example of the format.
+0 1
+2 3
+4 5
+6 7
+8 9
