@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-import itertools
 import os
-import re
 import statistics
 import subprocess
-import sys
 
 NUM_JOBS = 10
 WARMUP_ITERS = 40
@@ -69,7 +66,7 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
             except OSError:
                 pass
 
-    # Parse internal per-thread exact measurement if available
+    # Internal per-thread exact measurement if available
     ipc = 0.0
     inst = 0
     cycles = 0
@@ -84,15 +81,14 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
             cref = int(kv.get("cref", 0))
             cmis = int(kv.get("cmis", 0))
 
-    # Parse perf stat CSV output from stderr if internal counters were 0 or for extra events
+    # perf stat CSV output from stderr
     perf_events = {}
     for line in err.splitlines():
         parts = line.split(",")
         if len(parts) >= 3:
             val_str, _, event_name = parts[0].strip(), parts[1].strip(), parts[2].strip()
             try:
-                val = float(val_str)
-                perf_events[event_name] = val
+                perf_events[event_name] = float(val_str)
             except ValueError:
                 pass
 
@@ -186,40 +182,37 @@ def run_pair_measurement(serial_no, jobA, jobB, cpuA, cpuB, warmup, iters):
     return ipcA, ipcB
 
 
-def find_optimal_matching(pair_scores):
+def classify_job(st):
+    """Compute-bound: high IPC and very low cache MPKI. Otherwise memory-bound."""
+    inst = max(st["inst"], 1)
+    mpki = st["cmis"] * 1000.0 / inst
+    return "compute-bound" if (st["median_ipc"] > 1.15 and mpki < 1.0) else "memory-bound"
+
+
+def heuristic_matching(solo_stats):
     """
-    Finds the 5 disjoint pairs of jobs (0..9) that maximize the average pair score.
-    Uses dynamic programming over bitmasks of size 2^10 = 1024 (exact global optimum).
+    M = memory-bound jobs sorted by IPC ascending.
+    C = compute-bound jobs sorted by IPC descending.
+    Pair M[i] with C[i] (lowest-IPC M with highest-IPC C).
+    Leftovers (all from the larger class) are sorted by IPC and paired
+    outside-in: highest with lowest, next highest with next lowest, ...
     """
-    memo = {}
+    ipc = {j: solo_stats[j]["median_ipc"] for j in range(NUM_JOBS)}
+    M = sorted((j for j in range(NUM_JOBS) if classify_job(solo_stats[j]) == "memory-bound"),
+               key=lambda j: ipc[j])
+    C = sorted((j for j in range(NUM_JOBS) if classify_job(solo_stats[j]) == "compute-bound"),
+               key=lambda j: ipc[j], reverse=True)
 
-    def solve(mask):
-        if mask == (1 << NUM_JOBS) - 1:
-            return 0.0, []
-        if mask in memo:
-            return memo[mask]
+    k = min(len(M), len(C))
+    pairs = [(M[i], C[i]) for i in range(k)]
 
-        # Find first unmatched job
-        first = 0
-        while (mask & (1 << first)) != 0:
-            first += 1
-
-        best_val = -1.0
-        best_pairs = []
-        for second in range(first + 1, NUM_JOBS):
-            if (mask & (1 << second)) == 0:
-                new_mask = mask | (1 << first) | (1 << second)
-                sub_val, sub_pairs = solve(new_mask)
-                total_val = pair_scores[(first, second)] + sub_val
-                if total_val > best_val:
-                    best_val = total_val
-                    best_pairs = [(first, second)] + sub_pairs
-
-        memo[mask] = (best_val, best_pairs)
-        return best_val, best_pairs
-
-    total_score, pairs = solve(0)
-    return total_score / 5.0, pairs
+    left = sorted(M[k:] + C[k:], key=lambda j: ipc[j])
+    lo, hi = 0, len(left) - 1
+    while lo < hi:
+        pairs.append((left[lo], left[hi]))
+        lo += 1
+        hi -= 1
+    return pairs
 
 
 def main():
@@ -254,81 +247,69 @@ def main():
         solo_stats[j] = last_res
         solo_stats[j]["median_ipc"] = (solo_ipcA[j] + solo_ipcB[j]) / 2.0
 
-    # Step 2: Measure all 45 pairs on (cpuA, cpuB)
-    pair_scores = {}
+    # Step 2: Heuristic pairing from the solo profile (no brute force)
+    best_pairs = heuristic_matching(solo_stats)
+
+    # Step 3: Measure only the chosen pairs (for the report + sanity score)
     pair_details = {}
+    scores_all = []
+    for (i, j) in best_pairs:
+        scores, ipcs_i, ipcs_j = [], [], []
+        for r in range(PAIR_REPEATS):
+            # Alternate placement on cpuA/cpuB to cancel thread asymmetry
+            if r % 2 == 0:
+                ipc_i, ipc_j = run_pair_measurement(
+                    serial_no, i, j, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS)
+                base_i = solo_ipcA[i] if solo_ipcA[i] > 0 else 1.0
+                base_j = solo_ipcB[j] if solo_ipcB[j] > 0 else 1.0
+            else:
+                ipc_j, ipc_i = run_pair_measurement(
+                    serial_no, j, i, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS)
+                base_i = solo_ipcB[i] if solo_ipcB[i] > 0 else 1.0
+                base_j = solo_ipcA[j] if solo_ipcA[j] > 0 else 1.0
 
-    for i in range(NUM_JOBS):
-        for j in range(i + 1, NUM_JOBS):
-            scores = []
-            ipcs_i = []
-            ipcs_j = []
-            for r in range(PAIR_REPEATS):
-                # Alternate placement on cpuA/cpuB to eliminate any slight thread asymmetry
-                if r % 2 == 0:
-                    ipc_i, ipc_j = run_pair_measurement(
-                        serial_no, i, j, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS
-                    )
-                    base_i = solo_ipcA[i] if solo_ipcA[i] > 0 else 1.0
-                    base_j = solo_ipcB[j] if solo_ipcB[j] > 0 else 1.0
-                else:
-                    ipc_j, ipc_i = run_pair_measurement(
-                        serial_no, j, i, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS
-                    )
-                    base_i = solo_ipcB[i] if solo_ipcB[i] > 0 else 1.0
-                    base_j = solo_ipcA[j] if solo_ipcA[j] > 0 else 1.0
+            scores.append(ipc_i / base_i + ipc_j / base_j)
+            ipcs_i.append(ipc_i)
+            ipcs_j.append(ipc_j)
 
-                s = (ipc_i / base_i) + (ipc_j / base_j)
-                scores.append(s)
-                ipcs_i.append(ipc_i)
-                ipcs_j.append(ipc_j)
+        med = statistics.median(scores)
+        scores_all.append(med)
+        pair_details[(i, j)] = {
+            "ipcA_alone": solo_stats[i]["median_ipc"],
+            "ipcB_alone": solo_stats[j]["median_ipc"],
+            "ipcA_paired": statistics.median(ipcs_i),
+            "ipcB_paired": statistics.median(ipcs_j),
+            "score": med,
+        }
+    best_avg_score = sum(scores_all) / len(scores_all)
 
-            med_score = statistics.median(scores)
-            pair_scores[(i, j)] = med_score
-            pair_scores[(j, i)] = med_score
-            pair_details[(i, j)] = {
-                "ipcA_alone": solo_stats[i]["median_ipc"],
-                "ipcB_alone": solo_stats[j]["median_ipc"],
-                "ipcA_paired": statistics.median(ipcs_i),
-                "ipcB_paired": statistics.median(ipcs_j),
-                "score": med_score,
-            }
-
-    # Step 3: Find global optimal schedule via exact bitmask DP over all 945 matchings
-    best_avg_score, best_pairs = find_optimal_matching(pair_scores)
-
-    # Write final schedule.txt (strictly 5 lines of "A B")
+    # Final schedule (strictly 5 lines of "A B")
     with open("schedule.txt", "w") as f:
         for a, b in best_pairs:
             f.write(f"{a} {b}\n")
 
-    # Save a detailed summary file (`profile_report_data.txt`) so you have all
-    # exact numbers for report.pdf without polluting stdout during grading.
+    # Detailed data for report.pdf
     with open("profile_report_data.txt", "w") as f:
         f.write(f"SERIAL_NO: {serial_no}\n")
         f.write(f"SIBLING_CORES: {cpuA},{cpuB}\n\n")
+
         f.write("=== STEP 1: SOLO JOB CLASSIFICATION DATA ===\n")
-        f.write(f"{'Slot':<5} {'IPC':<10} {'Inst':<14} {'Cycles':<14} {'CacheRefs':<12} {'CacheMiss':<12} {'MPKI':<10} {'Class'}\n")
+        f.write(f"{'Slot':<5} {'IPC':<10} {'Inst':<14} {'Cycles':<14} {'CacheRefs':<12} "
+                f"{'CacheMiss':<12} {'MPKI':<10} {'Class'}\n")
         for j in range(NUM_JOBS):
             st = solo_stats[j]
-            inst = max(st["inst"], 1)
-            cmis = st["cmis"]
-            mpki = (cmis * 1000.0) / inst
-            # Compute-bound jobs have high IPC (>1.2) and very low cache MPKI (<1.0);
-            # Memory-bound jobs have lower IPC and significant cache traffic/misses.
-            jclass = "compute-bound" if (st["median_ipc"] > 1.15 and mpki < 1.0) else "memory-bound"
-            f.write(f"{j:<5} {st['median_ipc']:<10.4f} {st['inst']:<14} {st['cycles']:<14} {st['cref']:<12} {st['cmis']:<12} {mpki:<10.3f} {jclass}\n")
+            mpki = st["cmis"] * 1000.0 / max(st["inst"], 1)
+            f.write(f"{j:<5} {st['median_ipc']:<10.4f} {st['inst']:<14} {st['cycles']:<14} "
+                    f"{st['cref']:<12} {st['cmis']:<12} {mpki:<10.3f} {classify_job(st)}\n")
 
-        f.write("\n=== STEP 2 & 3: OPTIMAL SCHEDULE TABLE ===\n")
-        f.write(f"{'Pair':<5} {'SlotA':<6} {'SlotB':<6} {'IPC_A_alone':<12} {'IPC_B_alone':<12} {'IPC_A_pair':<12} {'IPC_B_pair':<12} {'PairScore':<10}\n")
+        f.write("\n=== HEURISTIC SCHEDULE (low-IPC M <-> high-IPC C, leftovers outside-in) ===\n")
+        f.write(f"{'Pair':<5} {'SlotA':<6} {'SlotB':<6} {'IPC_A_alone':<12} {'IPC_B_alone':<12} "
+                f"{'IPC_A_pair':<12} {'IPC_B_pair':<12} {'PairScore':<10}\n")
         for idx, (a, b) in enumerate(best_pairs, 1):
             d = pair_details[(a, b)]
-            f.write(f"{idx:<5} {a:<6} {b:<6} {d['ipcA_alone']:<12.4f} {d['ipcB_alone']:<12.4f} {d['ipcA_paired']:<12.4f} {d['ipcB_paired']:<12.4f} {d['score']:<10.4f}\n")
-        f.write(f"Average Schedule Score: {best_avg_score:.4f}\n\n")
-
-        f.write("=== ALL 45 PAIR SCORES ===\n")
-        for (a, b), d in sorted(pair_details.items(), key=lambda x: x[1]["score"], reverse=True):
-            f.write(f"({a}, {b}): score={d['score']:.4f} (A: {d['ipcA_alone']:.3f}->{d['ipcA_paired']:.3f}, B: {d['ipcB_alone']:.3f}->{d['ipcB_paired']:.3f})\n")
+            f.write(f"{idx:<5} {a:<6} {b:<6} {d['ipcA_alone']:<12.4f} {d['ipcB_alone']:<12.4f} "
+                    f"{d['ipcA_paired']:<12.4f} {d['ipcB_paired']:<12.4f} {d['score']:<10.4f}\n")
+        f.write(f"Average Schedule Score: {best_avg_score:.4f}\n")
 
 
 if __name__ == "__main__":
