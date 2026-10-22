@@ -13,8 +13,7 @@ SOLO_REPEATS = 5
 PAIR_REPEATS = 3
 
 
-def build_binary():
-    """Compile main.c with libjobs.a."""
+def build_binary(): 
     cmd = ["gcc", "-O2", "-std=c11", "-Wall", "-Wextra", "-D_GNU_SOURCE",
            "main.c", "libjobs.a", "-o", "main", "-pthread"]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -30,18 +29,12 @@ def parse_kv_line(line):
 
 
 def classify_job(ipc, llc_miss_rate, tlb_miss_rate):
-    """
-    Classifies a job as either memory-bound or compute-bound.
-    IPC is the primary classifier; LLC and TLB miss rates are used
-    only when IPC falls in the intermediate range.
-    """
     if ipc > 1.5:
         return "compute-bound"
 
     if ipc <= 0.8:
         return "memory-bound"
 
-    # For intermediate IPC, use cache and TLB misses to decide.
     if llc_miss_rate > 15.0 or tlb_miss_rate > 1.0:
         return "memory-bound"
 
@@ -50,10 +43,6 @@ def classify_job(ipc, llc_miss_rate, tlb_miss_rate):
 
 
 def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
-    """
-    Runs ./main under `perf stat` using perf control FIFO/pipes so setup and warmup
-    are excluded from perf's counters, collecting IPC, LLC cache miss rate, and TLB miss rate.
-    """
     r_ctl, w_ctl = os.pipe()
     r_ack, w_ack = os.pipe()
     os.set_inheritable(w_ctl, True)
@@ -89,7 +78,6 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
             except OSError:
                 pass
 
-    # Parse internal per-thread exact measurement if available
     ipc = 0.0
     inst = 0
     cycles = 0
@@ -104,7 +92,6 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
             cref = int(kv.get("cref", 0))
             cmis = int(kv.get("cmis", 0))
 
-    # Parse perf stat CSV output from stderr for LLC and dTLB counters
     perf_events = {}
     for line in err.splitlines():
         parts = line.split(",")
@@ -112,7 +99,6 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
             val_str, _, event_name = parts[0].strip(), parts[1].strip(), parts[2].strip()
             try:
                 val = float(val_str)
-                # Strip any :u or PMU suffixes for clean lookup
                 clean_name = event_name.split(":")[0]
                 perf_events[clean_name] = val
             except ValueError:
@@ -128,7 +114,6 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
         cref = int(perf_events.get("cache-references", 0))
         cmis = int(perf_events.get("cache-misses", 0))
 
-    # Fallback to direct ./main invocation if `perf stat` failed completely
     if ipc == 0.0:
         proc2 = subprocess.run(
             ["./main", str(serial_no), "solo", str(job_id), str(cpu_id), str(warmup), str(iters)],
@@ -143,20 +128,17 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
                 cref = int(kv.get("cref", 0))
                 cmis = int(kv.get("cmis", 0))
 
-    # Calculate LLC Miss Rate (%)
     llc_loads = perf_events.get("LLC-loads", 0.0)
     llc_misses = perf_events.get("LLC-load-misses", 0.0)
     if llc_loads > 0:
         llc_miss_rate = (llc_misses / llc_loads) * 100.0
     elif cref > 0:
-        # Fallback to architectural cache-misses / cache-references if LLC PMU event is unavailable
         llc_loads = float(cref)
         llc_misses = float(cmis)
         llc_miss_rate = (llc_misses / llc_loads) * 100.0
     else:
         llc_miss_rate = 0.0
 
-    # Calculate dTLB Miss Rate (%)
     dtlb_loads = perf_events.get("dTLB-loads", 0.0)
     dtlb_misses = perf_events.get("dTLB-load-misses", 0.0)
     if dtlb_loads > 0:
@@ -185,11 +167,6 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
 
 
 def run_pair_measurement(serial_no, jobA, jobB, cpuA, cpuB, warmup, iters):
-    """
-    Measures jobA (pinned to cpuA) and jobB (pinned to cpuB) concurrently.
-    If internal perf_event_open counters are available, reads both directly.
-    Otherwise falls back to per-CPU perf stat on cpuA and cpuB.
-    """
     proc = subprocess.run(
         ["./main", str(serial_no), "pair", str(jobA), str(jobB),
          str(cpuA), str(cpuB), str(warmup), str(iters)],
@@ -238,10 +215,6 @@ def run_pair_measurement(serial_no, jobA, jobB, cpuA, cpuB, warmup, iters):
 
 
 def find_optimal_matching(pair_scores):
-    """
-    Finds the 5 disjoint pairs of jobs (0..9) that maximize the average pair score.
-    Uses dynamic programming over bitmasks of size 2^10 = 1024 (exact global optimum).
-    """
     memo = {}
 
     def solve(mask):
@@ -250,7 +223,6 @@ def find_optimal_matching(pair_scores):
         if mask in memo:
             return memo[mask]
 
-        # Find first unmatched job
         first = 0
         while (mask & (1 << first)) != 0:
             first += 1
@@ -285,7 +257,6 @@ def main():
 
     build_binary()
 
-    # Step 1: Measure each job alone on both sibling CPUs
     solo_ipcA = {}
     solo_ipcB = {}
     solo_stats = {}
@@ -317,7 +288,6 @@ def main():
             solo_stats[j]["median_tlb_miss_rate"]
         )
 
-    # Step 2: Measure all 45 pairs on (cpuA, cpuB)
     pair_scores = {}
     pair_details = {}
 
@@ -327,7 +297,6 @@ def main():
             ipcs_i = []
             ipcs_j = []
             for r in range(PAIR_REPEATS):
-                # Alternate placement on cpuA/cpuB to eliminate any slight thread asymmetry
                 if r % 2 == 0:
                     ipc_i, ipc_j = run_pair_measurement(
                         serial_no, i, j, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS
@@ -357,15 +326,12 @@ def main():
                 "score": med_score,
             }
 
-    # Step 3: Find global optimal schedule via exact bitmask DP over all 945 matchings
     best_avg_score, best_pairs = find_optimal_matching(pair_scores)
 
-    # Write final schedule.txt (strictly 5 lines of "A B")
     with open("schedule.txt", "w") as f:
         for a, b in best_pairs:
             f.write(f"{a} {b}\n")
 
-    # Save a detailed summary file (`profile_report_data.txt`) with IPC, LLC Miss Rate, and TLB Miss Rate
     with open("profile_report_data.txt", "w") as f:
         f.write(f"SERIAL_NO: {serial_no}\n")
         f.write(f"SIBLING_CORES: {cpuA},{cpuB}\n\n")
@@ -391,11 +357,6 @@ def main():
             d = pair_details[(a, b)]
             f.write(f"{idx:<5} {a:<6} {b:<6} {d['ipcA_alone']:<12.4f} {d['ipcB_alone']:<12.4f} {d['ipcA_paired']:<12.4f} {d['ipcB_paired']:<12.4f} {d['score']:<10.4f}\n")
         f.write(f"Average Schedule Score: {best_avg_score:.4f}\n\n")
-
-        f.write("=== ALL 45 PAIR SCORES ===\n")
-        for (a, b), d in sorted(pair_details.items(), key=lambda x: x[1]["score"], reverse=True):
-            f.write(f"({a}, {b}): score={d['score']:.4f} (A: {d['ipcA_alone']:.3f}->{d['ipcA_paired']:.3f}, B: {d['ipcB_alone']:.3f}->{d['ipcB_paired']:.3f})\n")
-
 
 if __name__ == "__main__":
     main()
