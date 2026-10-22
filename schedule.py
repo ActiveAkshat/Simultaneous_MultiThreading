@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+import itertools
 import os
+import re
 import statistics
 import subprocess
+import sys
 
 NUM_JOBS = 10
 WARMUP_ITERS = 40
@@ -26,10 +29,30 @@ def parse_kv_line(line):
     return data
 
 
+def classify_job(ipc, llc_miss_rate, tlb_miss_rate):
+    """
+    Classifies a job as either memory-bound or compute-bound.
+    IPC is the primary classifier; LLC and TLB miss rates are used
+    only when IPC falls in the intermediate range.
+    """
+    if ipc > 1.5:
+        return "compute-bound"
+
+    if ipc <= 0.8:
+        return "memory-bound"
+
+    # For intermediate IPC, use cache and TLB misses to decide.
+    if llc_miss_rate > 15.0 or tlb_miss_rate > 1.0:
+        return "memory-bound"
+
+    return "compute-bound"
+
+
+
 def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
     """
     Runs ./main under `perf stat` using perf control FIFO/pipes so setup and warmup
-    are excluded from perf's counters, and also collects internal per-thread counters.
+    are excluded from perf's counters, collecting IPC, LLC cache miss rate, and TLB miss rate.
     """
     r_ctl, w_ctl = os.pipe()
     r_ack, w_ack = os.pipe()
@@ -40,7 +63,7 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
 
     perf_cmd = [
         "perf", "stat", "-x", ",",
-        "-e", "instructions,cycles,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses",
+        "-e", "instructions,cycles,cache-references,cache-misses,LLC-loads,LLC-load-misses,dTLB-loads,dTLB-load-misses",
         f"--control=fd:{r_ctl},{w_ack}",
         "./main", str(serial_no), "solo", str(job_id), str(cpu_id),
         str(warmup), str(iters), str(w_ctl), str(r_ack)
@@ -66,7 +89,7 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
             except OSError:
                 pass
 
-    # Internal per-thread exact measurement if available
+    # Parse internal per-thread exact measurement if available
     ipc = 0.0
     inst = 0
     cycles = 0
@@ -81,19 +104,21 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
             cref = int(kv.get("cref", 0))
             cmis = int(kv.get("cmis", 0))
 
-    # perf stat CSV output from stderr
+    # Parse perf stat CSV output from stderr for LLC and dTLB counters
     perf_events = {}
     for line in err.splitlines():
         parts = line.split(",")
         if len(parts) >= 3:
             val_str, _, event_name = parts[0].strip(), parts[1].strip(), parts[2].strip()
             try:
-                perf_events[event_name] = float(val_str)
+                val = float(val_str)
+                # Strip any :u or PMU suffixes for clean lookup
+                clean_name = event_name.split(":")[0]
+                perf_events[clean_name] = val
             except ValueError:
                 pass
 
     if ipc == 0.0:
-        # Fallback to perf stat counters
         p_inst = perf_events.get("instructions", 0.0)
         p_cycl = perf_events.get("cycles", 0.0)
         if p_cycl > 0:
@@ -118,12 +143,42 @@ def run_solo_measurement(serial_no, job_id, cpu_id, warmup, iters):
                 cref = int(kv.get("cref", 0))
                 cmis = int(kv.get("cmis", 0))
 
+    # Calculate LLC Miss Rate (%)
+    llc_loads = perf_events.get("LLC-loads", 0.0)
+    llc_misses = perf_events.get("LLC-load-misses", 0.0)
+    if llc_loads > 0:
+        llc_miss_rate = (llc_misses / llc_loads) * 100.0
+    elif cref > 0:
+        # Fallback to architectural cache-misses / cache-references if LLC PMU event is unavailable
+        llc_loads = float(cref)
+        llc_misses = float(cmis)
+        llc_miss_rate = (llc_misses / llc_loads) * 100.0
+    else:
+        llc_miss_rate = 0.0
+
+    # Calculate dTLB Miss Rate (%)
+    dtlb_loads = perf_events.get("dTLB-loads", 0.0)
+    dtlb_misses = perf_events.get("dTLB-load-misses", 0.0)
+    if dtlb_loads > 0:
+        tlb_miss_rate = (dtlb_misses / dtlb_loads) * 100.0
+    elif inst > 0 and dtlb_misses > 0:
+        # Fallback estimation if dTLB-loads is not supported but dTLB-load-misses is
+        tlb_miss_rate = (dtlb_misses / float(inst)) * 100.0
+    else:
+        tlb_miss_rate = 0.0
+
     return {
         "ipc": ipc,
         "inst": inst,
         "cycles": cycles,
         "cref": cref,
         "cmis": cmis,
+        "llc_loads": int(llc_loads),
+        "llc_misses": int(llc_misses),
+        "llc_miss_rate": llc_miss_rate,
+        "dtlb_loads": int(dtlb_loads),
+        "dtlb_misses": int(dtlb_misses),
+        "tlb_miss_rate": tlb_miss_rate,
         "perf_events": perf_events,
         "perf_raw": err
     }
@@ -182,37 +237,40 @@ def run_pair_measurement(serial_no, jobA, jobB, cpuA, cpuB, warmup, iters):
     return ipcA, ipcB
 
 
-def classify_job(st):
-    """Compute-bound: high IPC and very low cache MPKI. Otherwise memory-bound."""
-    inst = max(st["inst"], 1)
-    mpki = st["cmis"] * 1000.0 / inst
-    return "compute-bound" if (st["median_ipc"] > 1.15 and mpki < 1.0) else "memory-bound"
-
-
-def heuristic_matching(solo_stats):
+def find_optimal_matching(pair_scores):
     """
-    M = memory-bound jobs sorted by IPC ascending.
-    C = compute-bound jobs sorted by IPC descending.
-    Pair M[i] with C[i] (lowest-IPC M with highest-IPC C).
-    Leftovers (all from the larger class) are sorted by IPC and paired
-    outside-in: highest with lowest, next highest with next lowest, ...
+    Finds the 5 disjoint pairs of jobs (0..9) that maximize the average pair score.
+    Uses dynamic programming over bitmasks of size 2^10 = 1024 (exact global optimum).
     """
-    ipc = {j: solo_stats[j]["median_ipc"] for j in range(NUM_JOBS)}
-    M = sorted((j for j in range(NUM_JOBS) if classify_job(solo_stats[j]) == "memory-bound"),
-               key=lambda j: ipc[j])
-    C = sorted((j for j in range(NUM_JOBS) if classify_job(solo_stats[j]) == "compute-bound"),
-               key=lambda j: ipc[j], reverse=True)
+    memo = {}
 
-    k = min(len(M), len(C))
-    pairs = [(M[i], C[i]) for i in range(k)]
+    def solve(mask):
+        if mask == (1 << NUM_JOBS) - 1:
+            return 0.0, []
+        if mask in memo:
+            return memo[mask]
 
-    left = sorted(M[k:] + C[k:], key=lambda j: ipc[j])
-    lo, hi = 0, len(left) - 1
-    while lo < hi:
-        pairs.append((left[lo], left[hi]))
-        lo += 1
-        hi -= 1
-    return pairs
+        # Find first unmatched job
+        first = 0
+        while (mask & (1 << first)) != 0:
+            first += 1
+
+        best_val = -1.0
+        best_pairs = []
+        for second in range(first + 1, NUM_JOBS):
+            if (mask & (1 << second)) == 0:
+                new_mask = mask | (1 << first) | (1 << second)
+                sub_val, sub_pairs = solve(new_mask)
+                total_val = pair_scores[(first, second)] + sub_val
+                if total_val > best_val:
+                    best_val = total_val
+                    best_pairs = [(first, second)] + sub_pairs
+
+        memo[mask] = (best_val, best_pairs)
+        return best_val, best_pairs
+
+    total_score, pairs = solve(0)
+    return total_score / 5.0, pairs
 
 
 def main():
@@ -235,81 +293,108 @@ def main():
     for j in range(NUM_JOBS):
         ipcs_a = []
         ipcs_b = []
+        llc_rates = []
+        tlb_rates = []
         last_res = None
         for _ in range(SOLO_REPEATS):
             res_a = run_solo_measurement(serial_no, j, cpuA, WARMUP_ITERS, MEAS_ITERS)
             res_b = run_solo_measurement(serial_no, j, cpuB, WARMUP_ITERS, MEAS_ITERS)
             ipcs_a.append(res_a["ipc"])
             ipcs_b.append(res_b["ipc"])
+            llc_rates.extend([res_a["llc_miss_rate"], res_b["llc_miss_rate"]])
+            tlb_rates.extend([res_a["tlb_miss_rate"], res_b["tlb_miss_rate"]])
             last_res = res_a
+
         solo_ipcA[j] = statistics.median(ipcs_a)
         solo_ipcB[j] = statistics.median(ipcs_b)
         solo_stats[j] = last_res
         solo_stats[j]["median_ipc"] = (solo_ipcA[j] + solo_ipcB[j]) / 2.0
+        solo_stats[j]["median_llc_miss_rate"] = statistics.median(llc_rates)
+        solo_stats[j]["median_tlb_miss_rate"] = statistics.median(tlb_rates)
+        solo_stats[j]["class"] = classify_job(
+            solo_stats[j]["median_ipc"],
+            solo_stats[j]["median_llc_miss_rate"],
+            solo_stats[j]["median_tlb_miss_rate"]
+        )
 
-    # Step 2: Heuristic pairing from the solo profile (no brute force)
-    best_pairs = heuristic_matching(solo_stats)
-
-    # Step 3: Measure only the chosen pairs (for the report + sanity score)
+    # Step 2: Measure all 45 pairs on (cpuA, cpuB)
+    pair_scores = {}
     pair_details = {}
-    scores_all = []
-    for (i, j) in best_pairs:
-        scores, ipcs_i, ipcs_j = [], [], []
-        for r in range(PAIR_REPEATS):
-            # Alternate placement on cpuA/cpuB to cancel thread asymmetry
-            if r % 2 == 0:
-                ipc_i, ipc_j = run_pair_measurement(
-                    serial_no, i, j, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS)
-                base_i = solo_ipcA[i] if solo_ipcA[i] > 0 else 1.0
-                base_j = solo_ipcB[j] if solo_ipcB[j] > 0 else 1.0
-            else:
-                ipc_j, ipc_i = run_pair_measurement(
-                    serial_no, j, i, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS)
-                base_i = solo_ipcB[i] if solo_ipcB[i] > 0 else 1.0
-                base_j = solo_ipcA[j] if solo_ipcA[j] > 0 else 1.0
 
-            scores.append(ipc_i / base_i + ipc_j / base_j)
-            ipcs_i.append(ipc_i)
-            ipcs_j.append(ipc_j)
+    for i in range(NUM_JOBS):
+        for j in range(i + 1, NUM_JOBS):
+            scores = []
+            ipcs_i = []
+            ipcs_j = []
+            for r in range(PAIR_REPEATS):
+                # Alternate placement on cpuA/cpuB to eliminate any slight thread asymmetry
+                if r % 2 == 0:
+                    ipc_i, ipc_j = run_pair_measurement(
+                        serial_no, i, j, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS
+                    )
+                    base_i = solo_ipcA[i] if solo_ipcA[i] > 0 else 1.0
+                    base_j = solo_ipcB[j] if solo_ipcB[j] > 0 else 1.0
+                else:
+                    ipc_j, ipc_i = run_pair_measurement(
+                        serial_no, j, i, cpuA, cpuB, WARMUP_ITERS, MEAS_ITERS
+                    )
+                    base_i = solo_ipcB[i] if solo_ipcB[i] > 0 else 1.0
+                    base_j = solo_ipcA[j] if solo_ipcA[j] > 0 else 1.0
 
-        med = statistics.median(scores)
-        scores_all.append(med)
-        pair_details[(i, j)] = {
-            "ipcA_alone": solo_stats[i]["median_ipc"],
-            "ipcB_alone": solo_stats[j]["median_ipc"],
-            "ipcA_paired": statistics.median(ipcs_i),
-            "ipcB_paired": statistics.median(ipcs_j),
-            "score": med,
-        }
-    best_avg_score = sum(scores_all) / len(scores_all)
+                s = (ipc_i / base_i) + (ipc_j / base_j)
+                scores.append(s)
+                ipcs_i.append(ipc_i)
+                ipcs_j.append(ipc_j)
 
-    # Final schedule (strictly 5 lines of "A B")
+            med_score = statistics.median(scores)
+            pair_scores[(i, j)] = med_score
+            pair_scores[(j, i)] = med_score
+            pair_details[(i, j)] = {
+                "ipcA_alone": solo_stats[i]["median_ipc"],
+                "ipcB_alone": solo_stats[j]["median_ipc"],
+                "ipcA_paired": statistics.median(ipcs_i),
+                "ipcB_paired": statistics.median(ipcs_j),
+                "score": med_score,
+            }
+
+    # Step 3: Find global optimal schedule via exact bitmask DP over all 945 matchings
+    best_avg_score, best_pairs = find_optimal_matching(pair_scores)
+
+    # Write final schedule.txt (strictly 5 lines of "A B")
     with open("schedule.txt", "w") as f:
         for a, b in best_pairs:
             f.write(f"{a} {b}\n")
 
-    # Detailed data for report.pdf
+    # Save a detailed summary file (`profile_report_data.txt`) with IPC, LLC Miss Rate, and TLB Miss Rate
     with open("profile_report_data.txt", "w") as f:
         f.write(f"SERIAL_NO: {serial_no}\n")
         f.write(f"SIBLING_CORES: {cpuA},{cpuB}\n\n")
-
-        f.write("=== STEP 1: SOLO JOB CLASSIFICATION DATA ===\n")
-        f.write(f"{'Slot':<5} {'IPC':<10} {'Inst':<14} {'Cycles':<14} {'CacheRefs':<12} "
-                f"{'CacheMiss':<12} {'MPKI':<10} {'Class'}\n")
+        f.write("=== STEP 1: SOLO JOB CLASSIFICATION DATA (IPC, LLC Miss Rate, TLB Miss Rate) ===\n")
+        f.write(f"{'Slot':<5} {'IPC':<10} {'LLC_Loads':<12} {'LLC_Miss':<12} {'LLC_Miss%':<11} {'TLB_Loads':<12} {'TLB_Miss':<12} {'TLB_Miss%':<11} {'Class'}\n")
         for j in range(NUM_JOBS):
             st = solo_stats[j]
-            mpki = st["cmis"] * 1000.0 / max(st["inst"], 1)
-            f.write(f"{j:<5} {st['median_ipc']:<10.4f} {st['inst']:<14} {st['cycles']:<14} "
-                    f"{st['cref']:<12} {st['cmis']:<12} {mpki:<10.3f} {classify_job(st)}\n")
+            f.write(
+                f"{j:<5} "
+                f"{st['median_ipc']:<10.4f} "
+                f"{st['llc_loads']:<12} "
+                f"{st['llc_misses']:<12} "
+                f"{st['median_llc_miss_rate']:<11.4f} "
+                f"{st['dtlb_loads']:<12} "
+                f"{st['dtlb_misses']:<12} "
+                f"{st['median_tlb_miss_rate']:<11.4f} "
+                f"{st['class']}\n"
+            )
 
-        f.write("\n=== HEURISTIC SCHEDULE (low-IPC M <-> high-IPC C, leftovers outside-in) ===\n")
-        f.write(f"{'Pair':<5} {'SlotA':<6} {'SlotB':<6} {'IPC_A_alone':<12} {'IPC_B_alone':<12} "
-                f"{'IPC_A_pair':<12} {'IPC_B_pair':<12} {'PairScore':<10}\n")
+        f.write("\n=== STEP 2 & 3: OPTIMAL SCHEDULE TABLE ===\n")
+        f.write(f"{'Pair':<5} {'SlotA':<6} {'SlotB':<6} {'IPC_A_alone':<12} {'IPC_B_alone':<12} {'IPC_A_pair':<12} {'IPC_B_pair':<12} {'PairScore':<10}\n")
         for idx, (a, b) in enumerate(best_pairs, 1):
             d = pair_details[(a, b)]
-            f.write(f"{idx:<5} {a:<6} {b:<6} {d['ipcA_alone']:<12.4f} {d['ipcB_alone']:<12.4f} "
-                    f"{d['ipcA_paired']:<12.4f} {d['ipcB_paired']:<12.4f} {d['score']:<10.4f}\n")
-        f.write(f"Average Schedule Score: {best_avg_score:.4f}\n")
+            f.write(f"{idx:<5} {a:<6} {b:<6} {d['ipcA_alone']:<12.4f} {d['ipcB_alone']:<12.4f} {d['ipcA_paired']:<12.4f} {d['ipcB_paired']:<12.4f} {d['score']:<10.4f}\n")
+        f.write(f"Average Schedule Score: {best_avg_score:.4f}\n\n")
+
+        f.write("=== ALL 45 PAIR SCORES ===\n")
+        for (a, b), d in sorted(pair_details.items(), key=lambda x: x[1]["score"], reverse=True):
+            f.write(f"({a}, {b}): score={d['score']:.4f} (A: {d['ipcA_alone']:.3f}->{d['ipcA_paired']:.3f}, B: {d['ipcB_alone']:.3f}->{d['ipcB_paired']:.3f})\n")
 
 
 if __name__ == "__main__":
